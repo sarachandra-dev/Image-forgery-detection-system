@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pth
+*.egg-info/
+.venv/
+venv/
+dist/
+*.db
+
+# ML data & outputs
+ml/data/raw/
+ml/data/processed/
+ml/weights/
+backend/uploads/
+backend/outputs/
+backend/static/samples/
+backend/forgery.db
+
+# Node
+node_modules/
+frontend/dist/
+
+# Env
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
