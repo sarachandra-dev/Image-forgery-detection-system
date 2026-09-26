@@ -16,9 +16,14 @@ from ml.forensics.analyzer import ForensicAnalyzer
 class ForgeryPredictor:
     """
     State-of-the-Art Multi-Modal Image Forgery Predictor.
-    Integrates Deep Learning (ResNet50 + ResNet34 Fusion), Grad-CAM Saliency,
-    Error Level Analysis (ELA), Noise Print / SRM Residuals, 2D FFT Spectrum,
-    and Morphological Tamper Region Localization.
+    Pipeline:
+      1. Calibrated ELA (higher-order kurtosis/skew scoring)
+      2. Spatial Noise SRM Residual
+      3. 2D FFT Frequency Spectrum
+      4. EXIF Metadata Provenance
+      5. Dual-Stream ResNet50 + ResNet34 Fusion + Grad-CAM
+      6. Morphological Tamper Region Localization
+      7. Calibrated Ensemble Decision (ELA-dominant)
     """
 
     def __init__(self, weights_path: Optional[str] = None, device: str = "cpu"):
@@ -30,23 +35,25 @@ class ForgeryPredictor:
         try:
             self.model = FusionModel(pretrained=True).to(self.device)
             if weights_path and os.path.exists(weights_path):
-                self.model.load_state_dict(torch.load(weights_path, map_location=self.device))
+                self.model.load_state_dict(
+                    torch.load(weights_path, map_location=self.device, weights_only=True)
+                )
                 print(f"[OK] FusionModel loaded from {weights_path}")
             else:
                 print("[INFO] Pretrained backbone loaded without fine-tuned classifier.")
             self.model.eval()
 
-            # Target layer for Grad-CAM: last bottleneck layer in RGB stream
-            target_layer = list(self.model.rgb_stream[-2].children())[-1]
+            # Grad-CAM via model property for cleaner access
+            target_layer = self.model.target_cam_layer
             self.gradcam = GradCAM(self.model, target_layer)
         except Exception as e:
-            print(f"[WARN] Could not initialize neural FusionModel ({e}). Using forensic analyzer fallback.")
+            print(f"[WARN] Could not initialize FusionModel ({e}). Using forensic fallback only.")
             self.model = None
             self.gradcam = None
 
     @torch.no_grad()
     def predict(self, image: Image.Image) -> Dict[str, Any]:
-        """Fast prediction without heatmap."""
+        """Fast prediction (no heatmap saved)."""
         res = self.predict_with_heatmap(image)
         return {
             "label": res["label"],
@@ -57,101 +64,108 @@ class ForgeryPredictor:
 
     def predict_with_heatmap(self, image: Image.Image) -> Dict[str, Any]:
         """
-        Comprehensive forensic examination:
-        1. Multi-scale Error Level Analysis
-        2. Spatial Noise Residual Analysis
-        3. 2D FFT Frequency Spectrum
-        4. EXIF Metadata Tampering Check
-        5. Deep Feature Activation & Grad-CAM
-        6. Morphological Bounding Box Localization
-        7. Ensemble Calibrated Decision
+        Full 7-stage forensic pipeline:
+        1. ELA  2. Noise SRM  3. FFT  4. EXIF  5. Neural+GradCAM  6. Localization  7. Ensemble
         """
         orig_w, orig_h = image.size
 
-        # 1. Forensic ELA Analysis
+        # ── Stage 1: Calibrated ELA ──────────────────────────────────────────────
         ela_arr, ela_metrics = self.forensic_analyzer.analyze_ela(image)
+        ela_score = ela_metrics["ela_score"]                # 0.0–1.0 calibrated
 
-        # 2. Forensic Noise Residual Analysis
+        # ── Stage 2: Noise SRM Residual ─────────────────────────────────────────
         noise_arr, noise_metrics = self.forensic_analyzer.analyze_noise(image)
+        noise_score = noise_metrics["noise_score"]
 
-        # 3. Frequency Domain Analysis
+        # ── Stage 3: 2D FFT Spectrum ─────────────────────────────────────────────
         freq_metrics = self.forensic_analyzer.analyze_frequency(image)
+        freq_score = freq_metrics["frequency_anomaly_score"]
 
-        # 4. EXIF Metadata Forensics
+        # ── Stage 4: EXIF Metadata ───────────────────────────────────────────────
         exif_summary = self.forensic_analyzer.analyze_exif(image)
+        exif_risk = exif_summary["metadata_risk_score"]
 
-        # 5. Neural Deep Stream + Grad-CAM
-        neural_prob_forged = 0.5
+        # ── Stage 5: Neural Deep Stream + Grad-CAM ───────────────────────────────
+        neural_prob_forged = ela_score   # safe ELA-based fallback
         cam = None
 
         if self.model is not None and self.gradcam is not None:
             try:
-                rgb_tensor = preprocess_rgb(image).unsqueeze(0).to(self.device)
                 ela_tensor = preprocess_ela(ela_arr).unsqueeze(0).to(self.device)
-                rgb_tensor.requires_grad_(True)
+                rgb_tensor = preprocess_rgb(image).unsqueeze(0).to(self.device)
 
-                logits = self.model(rgb_tensor, ela_tensor)
-                probs = torch.softmax(logits, dim=1).squeeze().detach().cpu().numpy()
-                neural_prob_forged = float(probs[1]) if len(probs.shape) > 0 and probs.shape[0] > 1 else float(probs)
-
-                # Class 1 is 'forged'
-                cam = self.gradcam.generate(rgb_tensor, ela_tensor, class_idx=1)
+                with torch.enable_grad():
+                    logits = self.model(rgb_tensor, ela_tensor)
+                    probs = torch.softmax(logits, dim=1).squeeze().detach()
+                    neural_prob_forged = float(
+                        probs[1] if probs.ndim > 0 and probs.shape[0] > 1 else probs
+                    )
+                    # Grad-CAM for class 1 (forged)
+                    cam = self.gradcam.generate(rgb_tensor, ela_tensor, class_idx=1)
             except Exception as e:
-                print(f"GradCAM computation notice: {e}")
+                print(f"[GradCAM notice] {e}")
                 cam = None
 
-        # Fallback CAM if neural fails: synthesize from ELA & Noise
+        # ── Fallback Synthetic CAM from ELA + Noise ─────────────────────────────
         if cam is None:
             ela_gray = cv2.cvtColor(ela_arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
             noise_gray = cv2.cvtColor(noise_arr, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
-            cam = 0.6 * ela_gray + 0.4 * noise_gray
+            cam = 0.65 * ela_gray + 0.35 * noise_gray
             cam = cv2.resize(cam, (224, 224), interpolation=cv2.INTER_AREA)
-            cam = (cam - cam.min()) / max(cam.max() - cam.min(), 1e-4)
+            if cam.max() > cam.min():
+                cam = (cam - cam.min()) / (cam.max() - cam.min())
 
-        # 6. Morphological Tamper Region Extraction
+        # ── Stage 6: Morphological Tamper Region Localization ────────────────────
+        # Pass the calibrated ELA score so the localizer knows whether to hunt for regions
+        ela_preliminary = float(
+            0.55 * ela_score + 0.25 * noise_score + 0.20 * neural_prob_forged
+        )
         tamper_mask, regions, tamper_area_pct = self.forensic_analyzer.localize_tamper_regions(
             image_shape=(orig_h, orig_w),
             cam_map=cam,
             ela_gray=cv2.cvtColor(ela_arr, cv2.COLOR_RGB2GRAY),
             noise_gray=cv2.cvtColor(noise_arr, cv2.COLOR_RGB2GRAY),
-            threshold=0.52,
+            threshold=0.46,
+            anomaly_score=ela_preliminary,
         )
 
-        # 7. Multi-Disciplinary Calibrated Ensemble Scoring
-        # Combines Neural Probability, ELA Discrepancy, Noise Inconsistency, FFT Anomaly, and EXIF Risk
-        ela_score = ela_metrics["ela_score"]
-        noise_score = noise_metrics["noise_score"]
-        freq_score = freq_metrics["frequency_anomaly_score"]
-        exif_risk = exif_summary["metadata_risk_score"]
+        # ── Stage 7: Calibrated Ensemble Decision ────────────────────────────────
+        # Weights designed on kurtosis-calibrated ELA and real tamper detection data:
+        #   ELA Score  (35%) — primary signal: calibrated kurtosis/ratio anomaly
+        #   Neural CNN (30%) — ResNet50/34 fusion prediction
+        #   Noise SRM  (15%) — flat-block inconsistency
+        #   FFT        (10%) — frequency spike detection
+        #   EXIF       (10%) — metadata provenance risk
+        region_boost = 0.12 if len(regions) > 0 and tamper_area_pct > 2.0 else 0.0
 
-        # If tamper regions exist with high localized area, elevate score
-        region_boost = 0.15 if len(regions) > 0 and tamper_area_pct > 1.5 else 0.0
-
-        ensemble_forged_score = (
-            0.35 * neural_prob_forged
-            + 0.25 * ela_score
-            + 0.20 * noise_score
+        ensemble_forged = float(np.clip(
+            0.35 * ela_score
+            + 0.30 * neural_prob_forged
+            + 0.15 * noise_score
             + 0.10 * freq_score
             + 0.10 * exif_risk
-            + region_boost
-        )
-        ensemble_forged_score = float(np.clip(ensemble_forged_score, 0.01, 0.99))
-        ensemble_authentic_score = float(round(1.0 - ensemble_forged_score, 4))
-        ensemble_forged_score = float(round(ensemble_forged_score, 4))
+            + region_boost,
+            0.01, 0.99
+        ))
 
-        is_forged = ensemble_forged_score >= 0.50
+        ensemble_authentic = float(round(1.0 - ensemble_forged, 4))
+        ensemble_forged = float(round(ensemble_forged, 4))
+
+        is_forged = ensemble_forged >= 0.50
         label = "forged" if is_forged else "authentic"
-        confidence = ensemble_forged_score if is_forged else ensemble_authentic_score
+        confidence = ensemble_forged if is_forged else ensemble_authentic
 
-        # Severity determination
-        if not is_forged or tamper_area_pct < 0.5:
-            severity = "Clean" if ensemble_forged_score < 0.3 else "Low"
-        elif ensemble_forged_score > 0.80 or tamper_area_pct > 25.0:
+        # Severity
+        if not is_forged:
+            severity = "Clean"
+        elif ensemble_forged > 0.85 or tamper_area_pct > 20.0:
             severity = "Critical"
-        elif ensemble_forged_score > 0.65 or tamper_area_pct > 10.0:
+        elif ensemble_forged > 0.68 or tamper_area_pct > 8.0:
             severity = "High"
-        else:
+        elif ensemble_forged > 0.52 or tamper_area_pct > 2.0:
             severity = "Moderate"
+        else:
+            severity = "Low"
 
         heatmap_image = cam_to_heatmap(cam, image, alpha=0.55)
 
@@ -159,8 +173,8 @@ class ForgeryPredictor:
             "label": label,
             "confidence": float(round(confidence, 4)),
             "probabilities": {
-                "authentic": ensemble_authentic_score,
-                "forged": ensemble_forged_score,
+                "authentic": ensemble_authentic,
+                "forged": ensemble_forged,
             },
             "ela_array": ela_arr,
             "noise_array": noise_arr,
@@ -173,6 +187,7 @@ class ForgeryPredictor:
             "metrics": {
                 "ela_score": ela_score,
                 "ela_mean": ela_metrics["mean_error"],
+                "ela_kurtosis": ela_metrics.get("kurtosis", 0.0),
                 "ela_hotspot_ratio": ela_metrics["hotspot_ratio"],
                 "noise_inconsistency": noise_metrics["noise_inconsistency"],
                 "frequency_anomaly": freq_score,

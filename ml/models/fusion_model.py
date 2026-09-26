@@ -32,3 +32,9 @@ class FusionModel(nn.Module):
         ela_feat = self.ela_stream(ela).flatten(1)
         fused = torch.cat([rgb_feat, ela_feat], dim=1)
         return self.classifier(fused)
+
+    @property
+    def target_cam_layer(self) -> nn.Module:
+        """Returns target layer for Grad-CAM."""
+        return list(self.rgb_stream[-2].children())[-1]
+
